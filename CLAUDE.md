@@ -107,6 +107,30 @@ with workflow.unsafe.imports_passed_through():
 
 ## Key Conventions
 
+### Documentation Style
+
+All modules, classes, and public functions are documented with **Google-style docstrings**:
+
+```python
+def my_function(arg: str) -> bool:
+    """One-line summary.
+
+    Optional longer description paragraph.
+
+    Args:
+        arg: Description of the parameter.
+
+    Returns:
+        Description of the return value.
+
+    Raises:
+        ValueError: When and why this is raised.
+    """
+```
+
+Module-level docstrings describe the file's purpose, note important design decisions
+(e.g. why activities are co-located with the workflow), and include usage examples where helpful.
+
 ### Response Envelope
 
 Every endpoint returns `ApiResponse[T]` from `app/schemas/response.py`. Use the helpers:

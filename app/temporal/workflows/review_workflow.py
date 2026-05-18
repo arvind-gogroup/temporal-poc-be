@@ -1,3 +1,22 @@
+"""Temporal workflow definition for the employee review lifecycle.
+
+The workflow is started by ``WorkflowService.start_review()`` and progresses
+through its states by executing activities and waiting for external signals.
+
+Signal flow:
+    1. ``form_submitted`` — sent by the employee via ``POST …/signal/form_submitted``
+    2. ``lead_approved``  — sent by the lead via ``POST …/signal/lead_approved``
+
+Status-transition activities (``_set_waiting_approval``, ``_mark_completed``,
+``_mark_failed``) are defined at the bottom of this module rather than in
+``activities/`` to avoid circular imports while still keeping DB writes
+retryable by Temporal.
+
+Activity imports are wrapped in ``workflow.unsafe.imports_passed_through()``
+to bypass Temporal's determinism sandbox, which would otherwise block I/O-
+capable imports inside the workflow execution context.
+"""
+
 import logging
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -28,6 +47,15 @@ _ACTIVITY_RETRY = RetryPolicy(
 
 @dataclass
 class ReviewWorkflowInput:
+    """Input passed to :class:`ReviewWorkflow` when the execution is started.
+
+    Attributes:
+        workflow_id: Unique ID used as both the Temporal workflow ID and the
+            database ``workflow_id`` foreign key.
+        employee_id: Employee under review.
+        lead_id: Lead who will approve the review.
+    """
+
     workflow_id: str
     employee_id: str
     lead_id: str
@@ -35,26 +63,82 @@ class ReviewWorkflowInput:
 
 @dataclass
 class ReviewWorkflowResult:
+    """Value returned when the workflow execution completes.
+
+    Attributes:
+        workflow_id: The completed workflow's identifier.
+        status: Terminal status string (``"COMPLETED"`` or propagated exception).
+    """
+
     workflow_id: str
     status: str
 
 
 @workflow.defn
 class ReviewWorkflow:
+    """Durable Temporal workflow orchestrating the full employee review lifecycle.
+
+    State is held in instance variables that are populated by inbound signals.
+    All I/O (DB writes, notifications, AI calls) is delegated to activities so
+    that failures are retried automatically without re-running workflow logic.
+    """
+
     def __init__(self) -> None:
         self._form_data: dict | None = None
         self._rating: str | None = None
 
     @workflow.signal(name=SIGNAL_FORM_SUBMITTED)
     async def handle_form_submitted(self, form_data: dict) -> None:
+        """Receive the employee's self-review form via Temporal signal.
+
+        Sets ``_form_data``, which unblocks the ``wait_condition`` in :meth:`run`.
+
+        Args:
+            form_data: The free-form JSON payload submitted by the employee.
+        """
         self._form_data = form_data
 
     @workflow.signal(name=SIGNAL_LEAD_APPROVED)
     async def handle_lead_approved(self, rating: str) -> None:
+        """Receive the lead's approval and rating via Temporal signal.
+
+        Sets ``_rating``, which unblocks the ``wait_condition`` in :meth:`run`.
+
+        Args:
+            rating: The lead's rating string (e.g. ``"exceeds_expectations"``).
+        """
         self._rating = rating
 
     @workflow.run
     async def run(self, input: ReviewWorkflowInput) -> ReviewWorkflowResult:
+        """Execute the review workflow from start to completion.
+
+        Step sequence:
+            1. ``send_notification`` activity — sets DB status to ``WAITING_FORM``.
+            2. ``workflow.sleep(30s)`` — simulates a real-world waiting period.
+            3. Wait for the ``form_submitted`` signal (blocks indefinitely).
+            4. ``generate_ai_summary`` activity — persists form data and AI summary;
+               sets DB status to ``FORM_SUBMITTED``.
+            5. ``_set_waiting_approval`` activity — sets DB status to ``WAITING_APPROVAL``.
+            6. ``workflow.sleep(10s)`` — simulates the lead review period.
+            7. Wait for the ``lead_approved`` signal (blocks indefinitely).
+            8. ``send_completion_notification`` activity — persists rating;
+               sets DB status to ``APPROVED``.
+            9. ``_mark_completed`` activity — sets DB status to ``COMPLETED``.
+
+        If any step raises an unhandled exception, ``_mark_failed`` is called
+        before re-raising so the DB row always reflects the terminal error state.
+
+        Args:
+            input: Workflow identifiers required by the activities.
+
+        Returns:
+            A :class:`ReviewWorkflowResult` with ``status="COMPLETED"``.
+
+        Raises:
+            Exception: Re-raises any activity exception after marking the
+                workflow as ``FAILED`` in the database.
+        """
         try:
             # Step 1 — send initial notification, sets DB status → WAITING_FORM
             await workflow.execute_activity(
@@ -139,6 +223,14 @@ from temporalio import activity  # noqa: E402
 
 @activity.defn
 async def _set_waiting_approval(workflow_id: str) -> None:
+    """Set the workflow DB status to ``WAITING_APPROVAL``.
+
+    Called after the AI summary has been generated and the lead review period
+    sleep has elapsed.
+
+    Args:
+        workflow_id: Temporal workflow ID used to locate the DB row.
+    """
     from sqlalchemy import select
     from app.database import AsyncSessionFactory
     from app.models.review import ReviewWorkflow as _ReviewWorkflow
@@ -153,6 +245,14 @@ async def _set_waiting_approval(workflow_id: str) -> None:
 
 @activity.defn
 async def _mark_completed(workflow_id: str) -> None:
+    """Set the workflow DB status to ``COMPLETED``.
+
+    Called as the final step of the happy-path execution after the completion
+    notification has been sent.
+
+    Args:
+        workflow_id: Temporal workflow ID used to locate the DB row.
+    """
     from sqlalchemy import select
     from app.database import AsyncSessionFactory
     from app.models.review import ReviewWorkflow as _ReviewWorkflow
@@ -167,6 +267,14 @@ async def _mark_completed(workflow_id: str) -> None:
 
 @activity.defn
 async def _mark_failed(workflow_id: str) -> None:
+    """Set the workflow DB status to ``FAILED``.
+
+    Called inside the ``except`` block of :meth:`ReviewWorkflow.run` to ensure
+    the DB row always reflects a terminal error state when execution fails.
+
+    Args:
+        workflow_id: Temporal workflow ID used to locate the DB row.
+    """
     from sqlalchemy import select
     from app.database import AsyncSessionFactory
     from app.models.review import ReviewWorkflow as _ReviewWorkflow

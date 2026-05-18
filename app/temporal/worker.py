@@ -1,3 +1,15 @@
+"""Temporal worker process entrypoint.
+
+Registers all workflows and activities on the ``review-task-queue`` task queue
+and polls Temporal for work. Run directly via Docker Compose (``worker`` service)
+or locally with:
+
+    python -m app.temporal.worker
+
+The worker shares the same Docker image as the API (``Dockerfile.api``) but
+runs a different command and maintains its own Temporal client connection.
+"""
+
 import asyncio
 import logging
 
@@ -23,6 +35,16 @@ logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
+    """Initialise the Temporal worker and poll indefinitely.
+
+    Connects to Temporal using the shared client helper, registers all six
+    activities and the :class:`~app.temporal.workflows.review_workflow.ReviewWorkflow`
+    workflow, then blocks until the process is terminated.
+
+    Concurrency limits:
+        - ``max_concurrent_activities=10``
+        - ``max_concurrent_workflow_tasks=5``
+    """
     client = await get_temporal_client()
     logger.info("Worker connecting to task queue '%s'", TASK_QUEUE)
 
