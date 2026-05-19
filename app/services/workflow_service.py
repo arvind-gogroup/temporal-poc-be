@@ -17,6 +17,7 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+import temporalio.api.enums.v1
 from temporalio.client import Client, WorkflowFailureError
 
 from app.constants.enums import ReviewStatus
@@ -218,8 +219,8 @@ class WorkflowService:
             events.append(
                 HistoryEvent(
                     event_id=event.event_id,
-                    event_type=event.event_type.name,
-                    timestamp=event.event_time.isoformat() if event.event_time else "",
+                    event_type=temporalio.api.enums.v1.EventType.Name(event.event_type),
+                    timestamp=event.event_time.ToDatetime().isoformat() if event.event_time else "",
                     attributes={},
                 )
             )

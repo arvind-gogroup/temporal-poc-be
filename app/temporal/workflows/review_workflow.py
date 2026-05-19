@@ -17,6 +17,7 @@ to bypass Temporal's determinism sandbox, which would otherwise block I/O-
 capable imports inside the workflow execution context.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -153,7 +154,7 @@ class ReviewWorkflow:
             )
 
             # Step 2 — wait for form window (30s simulates days)
-            await workflow.sleep(timedelta(seconds=30))
+            await asyncio.sleep(30)
 
             # Step 3 — wait for form_submitted signal
             await workflow.wait_condition(lambda: self._form_data is not None)
@@ -177,7 +178,7 @@ class ReviewWorkflow:
                 start_to_close_timeout=timedelta(seconds=10),
                 retry_policy=_ACTIVITY_RETRY,
             )
-            await workflow.sleep(timedelta(seconds=10))
+            await asyncio.sleep(10)
 
             # Step 6 — wait for lead_approved signal
             await workflow.wait_condition(lambda: self._rating is not None)
