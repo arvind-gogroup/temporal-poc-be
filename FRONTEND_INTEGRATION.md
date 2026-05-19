@@ -275,18 +275,136 @@ interface SignalResponse {
 GET /api/reviews/{workflow_id}/history
 ```
 
-Returns the raw Temporal execution event history. Use for audit trails or debug views.
+Returns the Temporal execution history grouped into the six logical workflow stages.
+Use for the pipeline timeline UI, audit trails, and debug views.
 
 **Response — HTTP 200 — `ApiResponse<WorkflowHistoryResponse>`**
 ```ts
+interface StageEvent {
+  event_id: number;
+  event_type: string;   // raw Temporal type, e.g. "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+  label: string;        // human-readable, e.g. "Send notification"
+  timestamp: string;    // ISO 8601
+}
+
+interface WorkflowStage {
+  name: string;             // matches ReviewStatus values, e.g. "WAITING_FORM"
+  label: string;            // short display label, e.g. "Waiting Form"
+  description: string;      // subtitle for the UI, e.g. "Notification sent, awaiting self-review"
+  status: "completed" | "active" | "pending";
+  started_at: string | null;    // ISO 8601 — null if stage not yet reached
+  completed_at: string | null;  // ISO 8601 — null if stage still active or pending
+  event_count: number;
+  key_event: string | null;     // one-line summary of the most meaningful event
+  events: StageEvent[];
+}
+
 interface WorkflowHistoryResponse {
   workflow_id: string;
-  events: Array<{
-    event_id: number;
-    event_type: string;
-    timestamp: string;
-    attributes: Record<string, unknown>;
-  }>;
+  total_events: number;
+  stages: WorkflowStage[];  // always 6 stages in execution order
+}
+```
+
+**Stage `status` rules:**
+
+| `status` | Meaning |
+|---|---|
+| `"completed"` | Stage fully done — both `started_at` and `completed_at` are set |
+| `"active"` | Workflow is currently in this stage — `completed_at` is `null` |
+| `"pending"` | Not yet reached — `started_at` and `completed_at` are both `null` |
+
+**Example response:**
+```json
+{
+  "payload": {
+    "workflow_id": "review-EMP1-001-3c6ac9cf",
+    "total_events": 53,
+    "stages": [
+      {
+        "name": "INITIATED",
+        "label": "Initiated",
+        "description": "Workflow created",
+        "status": "completed",
+        "started_at": "2026-05-19T06:46:05.771806",
+        "completed_at": "2026-05-19T06:46:05.796694",
+        "event_count": 4,
+        "key_event": "Workflow execution started",
+        "events": [
+          {
+            "event_id": 1,
+            "event_type": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+            "label": "Workflow execution started",
+            "timestamp": "2026-05-19T06:46:05.771806"
+          }
+        ]
+      },
+      {
+        "name": "WAITING_FORM",
+        "label": "Waiting Form",
+        "description": "Notification sent, awaiting self-review",
+        "status": "completed",
+        "started_at": "2026-05-19T06:46:05.796694",
+        "completed_at": "2026-05-19T06:46:35.863995",
+        "event_count": 11,
+        "key_event": "Notification sent to employee and lead",
+        "events": [
+          {
+            "event_id": 5,
+            "event_type": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+            "label": "Send notification",
+            "timestamp": "2026-05-19T06:46:05.796694"
+          }
+        ]
+      },
+      {
+        "name": "FORM_SUBMITTED",
+        "label": "Form Submitted",
+        "description": "Self-review received, AI summary generated",
+        "status": "completed",
+        "started_at": "2026-05-19T06:57:14.544289",
+        "completed_at": "2026-05-19T06:57:14.579395",
+        "event_count": 10,
+        "key_event": "Self-review form received and AI summary generated",
+        "events": []
+      },
+      {
+        "name": "WAITING_APPROVAL",
+        "label": "Waiting Approval",
+        "description": "AI summary ready, awaiting lead approval",
+        "status": "completed",
+        "started_at": "2026-05-19T06:57:14.579395",
+        "completed_at": "2026-05-19T06:58:35.242713",
+        "event_count": 11,
+        "key_event": "Status set to waiting approval, lead review timer started",
+        "events": []
+      },
+      {
+        "name": "APPROVED",
+        "label": "Approved",
+        "description": "Lead approved, completion notification sent",
+        "status": "completed",
+        "started_at": "2026-05-19T06:58:35.242713",
+        "completed_at": "2026-05-19T06:58:35.279949",
+        "event_count": 10,
+        "key_event": "Lead approved the review and rating recorded",
+        "events": []
+      },
+      {
+        "name": "COMPLETED",
+        "label": "Completed",
+        "description": "Review process complete",
+        "status": "completed",
+        "started_at": "2026-05-19T06:58:35.279949",
+        "completed_at": "2026-05-19T06:58:35.310000",
+        "event_count": 7,
+        "key_event": "All activities complete, workflow closed",
+        "events": []
+      }
+    ]
+  },
+  "status": { "success": true, "code": 200 },
+  "meta": null
 }
 ```
 

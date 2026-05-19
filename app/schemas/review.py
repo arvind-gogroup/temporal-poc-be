@@ -161,20 +161,49 @@ class SignalResponse(BaseModel):
     workflow_id: str
 
 
-class HistoryEvent(BaseModel):
-    """A single event from the Temporal workflow execution history.
+class StageEvent(BaseModel):
+    """A single Temporal event within a workflow stage.
 
     Attributes:
         event_id: Sequential event identifier within the workflow execution.
-        event_type: Temporal event type name (e.g. ``"WorkflowExecutionStarted"``).
+        event_type: Raw Temporal event type string (e.g. ``"EVENT_TYPE_ACTIVITY_TASK_STARTED"``).
+        label: Human-readable description of the event for display purposes.
         timestamp: ISO 8601 timestamp of when the event occurred.
-        attributes: Raw event attributes dict (currently empty; extend as needed).
     """
 
     event_id: int
     event_type: str
+    label: str
     timestamp: str
-    attributes: dict
+
+
+class WorkflowStage(BaseModel):
+    """A logical stage grouping related Temporal events.
+
+    Maps to the six steps shown in the pipeline progress UI:
+    ``INITIATED → WAITING_FORM → FORM_SUBMITTED → WAITING_APPROVAL → APPROVED → COMPLETED``.
+
+    Attributes:
+        name: Stage identifier matching ``ReviewStatus`` values (e.g. ``"WAITING_FORM"``).
+        label: Short display label (e.g. ``"Waiting Form"``).
+        description: Subtitle shown beneath the stage in the UI (e.g. ``"Self-review pending"``).
+        status: One of ``"completed"``, ``"active"``, or ``"pending"``.
+        started_at: ISO 8601 timestamp of the first event in this stage. ``None`` if not yet reached.
+        completed_at: ISO 8601 timestamp of the last event in this stage. ``None`` if still active.
+        event_count: Number of raw Temporal events grouped into this stage.
+        key_event: Single-line summary of the most meaningful event in this stage.
+        events: Ordered list of individual Temporal events within this stage.
+    """
+
+    name: str
+    label: str
+    description: str
+    status: str
+    started_at: str | None
+    completed_at: str | None
+    event_count: int
+    key_event: str | None
+    events: list[StageEvent]
 
 
 class WorkflowHistoryResponse(BaseModel):
@@ -182,8 +211,10 @@ class WorkflowHistoryResponse(BaseModel):
 
     Attributes:
         workflow_id: The queried workflow's identifier.
-        events: Ordered list of Temporal execution events for audit/debug use.
+        total_events: Total number of raw Temporal events across all stages.
+        stages: Ordered list of logical workflow stages, each containing grouped events.
     """
 
     workflow_id: str
-    events: list[HistoryEvent]
+    total_events: int
+    stages: list[WorkflowStage]

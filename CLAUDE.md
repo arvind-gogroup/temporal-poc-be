@@ -163,6 +163,21 @@ Migrations are async-aware (`alembic/env.py` uses `asyncio.run()`). The `api` co
 
 ---
 
+## Frontend Integration Contract
+
+`FRONTEND_INTEGRATION.md` is the source of truth for the API contract consumed by the frontend.
+
+**Always update `FRONTEND_INTEGRATION.md` whenever you:**
+- Add, remove, or rename an endpoint
+- Change a request body or query parameter
+- Change a response schema (field names, types, nesting, new/removed fields)
+- Change an enum value in `app/constants/enums.py`
+- Change error behaviour (new status codes, changed error messages)
+
+Update the doc in the same commit as the code change — never leave them out of sync.
+
+---
+
 ## Live AI Summary
 
 `AI_SUMMARY_MOCK=true` (default) returns a template string. To wire up a real LLM, set `AI_SUMMARY_MOCK=false` and implement the call inside `app/temporal/activities/ai_summary.py` — the `NotImplementedError` placeholder is already there.

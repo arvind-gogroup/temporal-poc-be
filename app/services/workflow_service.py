@@ -24,15 +24,92 @@ from app.constants.enums import ReviewStatus
 from app.constants.temporal import SIGNAL_FORM_SUBMITTED, SIGNAL_LEAD_APPROVED, TASK_QUEUE
 from app.models.review import ReviewWorkflow
 from app.schemas.review import (
-    HistoryEvent,
     ReviewDetail,
     ReviewSummary,
+    StageEvent,
     StartReviewResponse,
     WorkflowHistoryResponse,
+    WorkflowStage,
 )
 from app.temporal.workflows.review_workflow import ReviewWorkflowInput
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# History-grouping helpers (module-level so they are easy to unit-test)
+# ---------------------------------------------------------------------------
+
+_EVENT_LABELS: dict[str, str] = {
+    "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED":   "Workflow execution started",
+    "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED":       "Workflow task scheduled",
+    "EVENT_TYPE_WORKFLOW_TASK_STARTED":         "Workflow task started",
+    "EVENT_TYPE_WORKFLOW_TASK_COMPLETED":       "Workflow task completed",
+    "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED":       "Activity scheduled",
+    "EVENT_TYPE_ACTIVITY_TASK_STARTED":         "Activity started",
+    "EVENT_TYPE_ACTIVITY_TASK_COMPLETED":       "Activity completed",
+    "EVENT_TYPE_TIMER_STARTED":                 "Timer started",
+    "EVENT_TYPE_TIMER_FIRED":                   "Timer elapsed",
+    "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED":   "Signal received",
+    "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED":  "Workflow completed",
+    "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED":     "Workflow failed",
+}
+
+_ACTIVITY_FRIENDLY: dict[str, str] = {
+    "send_notification":        "Send notification",
+    "generate_ai_summary":      "Generate AI summary",
+    "_set_waiting_approval":    "Set waiting approval",
+    "send_completion_notification": "Send completion notification",
+    "_mark_completed":          "Mark completed",
+    "_mark_failed":             "Mark failed",
+}
+
+_SIGNAL_FRIENDLY: dict[str, str] = {
+    "form_submitted":  "Employee submitted self-review form",
+    "lead_approved":   "Lead submitted approval and rating",
+}
+
+_STAGE_KEY_EVENTS: dict[str, str] = {
+    "INITIATED":        "Workflow execution started",
+    "WAITING_FORM":     "Notification sent to employee and lead",
+    "FORM_SUBMITTED":   "Self-review form received and AI summary generated",
+    "WAITING_APPROVAL": "Status set to waiting approval, lead review timer started",
+    "APPROVED":         "Lead approved the review and rating recorded",
+    "COMPLETED":        "All activities complete, workflow closed",
+}
+
+
+def _activity_name(event) -> str | None:
+    """Extract the activity type name from an ACTIVITY_TASK_SCHEDULED event."""
+    try:
+        return event.activity_task_scheduled_event_attributes.activity_type.name
+    except Exception:
+        return None
+
+
+def _signal_name(event) -> str | None:
+    """Extract the signal name from a WORKFLOW_EXECUTION_SIGNALED event."""
+    try:
+        return event.workflow_execution_signaled_event_attributes.signal_name
+    except Exception:
+        return None
+
+
+def _event_label(event_type: str, event) -> str:
+    """Build a human-readable label for a single Temporal event."""
+    if event_type == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED":
+        name = _activity_name(event)
+        return _ACTIVITY_FRIENDLY.get(name, f"Activity: {name}") if name else "Activity scheduled"
+    if event_type == "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED":
+        name = _signal_name(event)
+        return _SIGNAL_FRIENDLY.get(name, f"Signal: {name}") if name else "Signal received"
+    return _EVENT_LABELS.get(event_type, event_type)
+
+
+def _key_event(stage_name: str, events: list) -> str | None:
+    """Return a single-line summary for the stage, or None if the stage has no events."""
+    if not events:
+        return None
+    return _STAGE_KEY_EVENTS.get(stage_name)
 
 
 class WorkflowService:
@@ -194,17 +271,24 @@ class WorkflowService:
         logger.info("Sent lead_approved signal | workflow_id=%s", workflow_id)
 
     async def get_workflow_history(self, workflow_id: str) -> WorkflowHistoryResponse:
-        """Fetch the raw Temporal execution event history for a workflow.
+        """Fetch and group the Temporal execution history into logical workflow stages.
 
-        Validates existence via the DB before calling the Temporal API so that
-        a missing workflow returns a 404 rather than a Temporal SDK error.
+        Parses raw Temporal events and buckets them into the six stages of the review
+        lifecycle using activity type names and signal names as transition triggers.
+
+        Stage transitions are detected by:
+            - ``send_notification`` activity scheduled → enter WAITING_FORM
+            - ``form_submitted`` signal received → enter FORM_SUBMITTED
+            - ``_set_waiting_approval`` activity scheduled → enter WAITING_APPROVAL
+            - ``lead_approved`` signal received → enter APPROVED
+            - ``_mark_completed`` activity scheduled → enter COMPLETED
 
         Args:
             workflow_id: The target workflow identifier.
 
         Returns:
-            A :class:`~app.schemas.review.WorkflowHistoryResponse` containing
-            the ordered list of Temporal execution events.
+            A :class:`~app.schemas.review.WorkflowHistoryResponse` with stages,
+            each containing grouped events, status, timestamps, and a key event summary.
 
         Raises:
             LookupError: If no workflow with the given ID exists in the DB.
@@ -214,18 +298,86 @@ class WorkflowService:
         handle = self.temporal_client.get_workflow_handle(workflow_id)
         history = await handle.fetch_history()
 
-        events: list[HistoryEvent] = []
-        for event in history.events:
-            events.append(
-                HistoryEvent(
-                    event_id=event.event_id,
-                    event_type=temporalio.api.enums.v1.EventType.Name(event.event_type),
-                    timestamp=event.event_time.ToDatetime().isoformat() if event.event_time else "",
-                    attributes={},
+        # Stage definitions in execution order
+        stage_defs = [
+            ("INITIATED",         "Initiated",         "Workflow created"),
+            ("WAITING_FORM",      "Waiting Form",      "Notification sent, awaiting self-review"),
+            ("FORM_SUBMITTED",    "Form Submitted",     "Self-review received, AI summary generated"),
+            ("WAITING_APPROVAL",  "Waiting Approval",  "AI summary ready, awaiting lead approval"),
+            ("APPROVED",          "Approved",           "Lead approved, completion notification sent"),
+            ("COMPLETED",         "Completed",          "Review process complete"),
+        ]
+
+        # Buckets: one list of StageEvent per stage
+        buckets: list[list[StageEvent]] = [[] for _ in stage_defs]
+        current = 0  # index into stage_defs
+
+        for raw in history.events:
+            event_type = temporalio.api.enums.v1.EventType.Name(raw.event_type)
+            ts = raw.event_time.ToDatetime().isoformat() if raw.event_time else ""
+
+            # Detect stage transition before assigning this event
+            if current == 0 and _activity_name(raw) == "send_notification":
+                current = 1
+            elif current == 1 and _signal_name(raw) == SIGNAL_FORM_SUBMITTED:
+                current = 2
+            elif current == 2 and _activity_name(raw) == "_set_waiting_approval":
+                current = 3
+            elif current == 3 and _signal_name(raw) == SIGNAL_LEAD_APPROVED:
+                current = 4
+            elif current == 4 and _activity_name(raw) == "_mark_completed":
+                current = 5
+
+            buckets[current].append(
+                StageEvent(
+                    event_id=raw.event_id,
+                    event_type=event_type,
+                    label=_event_label(event_type, raw),
+                    timestamp=ts,
                 )
             )
 
-        return WorkflowHistoryResponse(workflow_id=workflow_id, events=events)
+        stages: list[WorkflowStage] = []
+        for i, (name, label, description) in enumerate(stage_defs):
+            evts = buckets[i]
+            started_at = evts[0].timestamp if evts else None
+            completed_at = evts[-1].timestamp if evts else None
+
+            if not evts:
+                status = "pending"
+                completed_at = None
+            elif i < current:
+                status = "completed"
+            elif i == current:
+                # Last stage (COMPLETED) with WORKFLOW_EXECUTION_COMPLETED event → fully done
+                last_type = evts[-1].event_type if evts else ""
+                status = "completed" if last_type == "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED" else "active"
+                if status == "active":
+                    completed_at = None
+            else:
+                status = "pending"
+                started_at = None
+                completed_at = None
+
+            stages.append(
+                WorkflowStage(
+                    name=name,
+                    label=label,
+                    description=description,
+                    status=status,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    event_count=len(evts),
+                    key_event=_key_event(name, evts),
+                    events=evts,
+                )
+            )
+
+        return WorkflowHistoryResponse(
+            workflow_id=workflow_id,
+            total_events=len(history.events),
+            stages=stages,
+        )
 
     async def _get_row_or_404(self, workflow_id: str) -> ReviewWorkflow:
         """Fetch a workflow DB row by ID, raising ``LookupError`` if absent.
